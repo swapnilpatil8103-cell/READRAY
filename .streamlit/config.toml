@@ -1,0 +1,15 @@
+[server]
+# Uploads are validated again in the app (READRAY_MAX_PDF_MB, default 50 MB).
+maxUploadSize = 50
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[theme]
+primaryColor = "#3b5b92"
+font = "sans-serif"

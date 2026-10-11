@@ -1,0 +1,27 @@
+# Secrets — never commit
+.streamlit/secrets.toml
+.env
+*.env
+
+# Local Readray data (papers, notes)
+.readray_data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+.coverage
+htmlcov/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local tool config
+.claude/

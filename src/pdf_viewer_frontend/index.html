@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Readray PDF viewer</title>
+<style>
+  :root {
+    --bg: #eef0f3; --paper-shadow: 0 1px 3px rgba(0,0,0,.18), 0 4px 18px rgba(0,0,0,.08);
+    --accent: #3b5b92; --text: #1f2933; --muted: #5f6b7a; --toolbar: #ffffff; --border: #dde1e7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#1b1e23; --toolbar:#24282f; --text:#e6e9ee; --muted:#9aa4b2; --border:#353b45; --accent:#8fb0e8; }
+  }
+  :root[data-theme="dark"] { --bg:#1b1e23; --toolbar:#24282f; --text:#e6e9ee; --muted:#9aa4b2; --border:#353b45; --accent:#8fb0e8; }
+  html, body { margin: 0; padding: 0; background: transparent; font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); }
+  #bar { display: flex; gap: 6px; align-items: center; padding: 6px 8px; background: var(--toolbar); border: 1px solid var(--border);
+         border-bottom: none; border-radius: 8px 8px 0 0; font-size: 12.5px; flex-wrap: wrap; }
+  #bar button { font: inherit; border: 1px solid var(--border); background: transparent; color: var(--text); padding: 4px 10px;
+                border-radius: 6px; cursor: pointer; }
+  #bar button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #bar .hint { color: var(--muted); margin-left: auto; }
+  #scroller { overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 0 0 8px 8px; position: relative; }
+  #page { position: relative; margin: 14px auto; box-shadow: var(--paper-shadow); background: #fff; }
+  #page img { display: block; width: 100%; height: 100%; user-select: none; -webkit-user-drag: none; }
+  #textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1; }
+  #textLayer span { position: absolute; white-space: pre; color: transparent; transform-origin: 0 0; cursor: text;
+                    font-family: Arial, Helvetica, sans-serif; }
+  #textLayer ::selection { background: rgba(59, 91, 146, .35); color: transparent; }
+  #hlLayer, #cropLayer { position: absolute; inset: 0; pointer-events: none; }
+  .hl { position: absolute; background: rgba(255, 196, 0, .38); border-radius: 2px; mix-blend-mode: multiply; }
+  #cropLayer.active { pointer-events: auto; cursor: crosshair; }
+  #cropBox { position: absolute; border: 2px dashed var(--accent); background: rgba(59,91,146,.10); display: none; }
+  #pop { position: absolute; display: none; z-index: 10; background: var(--toolbar); border: 1px solid var(--border); border-radius: 8px;
+         box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px; gap: 4px; }
+  #pop button { font: 12.5px Inter, system-ui, sans-serif; border: none; background: var(--accent); color: #fff; padding: 6px 10px;
+                border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  #pop button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="bar" role="toolbar" aria-label="Viewer tools">
+  <button id="modeSelect" aria-pressed="true" title="Select text with the mouse, then send it to the assistant">Select text</button>
+  <button id="modeCrop" aria-pressed="false" title="Drag a rectangle around a figure, table or equation">Crop region</button>
+  <span class="hint" id="hint">Select text, then click “Use selection”.</span>
+</div>
+<div id="scroller">
+  <div id="page">
+    <img id="img" alt="PDF page">
+    <div id="hlLayer"></div>
+    <div id="textLayer"></div>
+    <div id="cropLayer"><div id="cropBox"></div></div>
+  </div>
+  <div id="pop"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  // Minimal implementation of the Streamlit component protocol (no external libraries, no CDN).
+  function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*"); }
+  function setValue(value) { send("streamlit:setComponentValue", { value: value, dataType: "json" }); }
+  function setHeight(h) { send("streamlit:setFrameHeight", { height: h }); }
+
+  var args = null, lastSig = null, mode = "select", lastHeight = 0;
+  var el = function (id) { return document.getElementById(id); };
+  var img = el("img"), page = el("page"), textLayer = el("textLayer"), hlLayer = el("hlLayer"),
+      cropLayer = el("cropLayer"), cropBox = el("cropBox"), pop = el("pop"), scroller = el("scroller"), hint = el("hint");
+  var measureCtx = document.createElement("canvas").getContext("2d");
+
+  function displaySize() {
+    var ratio = args.page_height / args.page_width;
+    var avail = Math.max(200, document.body.clientWidth - 30);
+    var viewH = args.height - el("bar").offsetHeight - 30;
+    var w;
+    if (args.zoom === "fit-width") w = avail;
+    else if (args.zoom === "fit-page") w = Math.min(avail, viewH / ratio);
+    else w = args.page_width * (96 / 72) * Number(args.zoom);
+    return { w: Math.round(w), h: Math.round(w * ratio) };
+  }
+
+  function layout() {
+    if (!args) return;
+    var size = displaySize();
+    page.style.width = size.w + "px";
+    page.style.height = size.h + "px";
+    scroller.style.height = (args.height - el("bar").offsetHeight - 2) + "px";
+    buildTextLayer(size);
+    buildHighlights(size);
+    var h = args.height + 2;
+    if (h !== lastHeight) { lastHeight = h; setHeight(h); }
+  }
+
+  function buildTextLayer(size) {
+    textLayer.textContent = "";
+    var frag = document.createDocumentFragment();
+    (args.lines || []).forEach(function (ln) {
+      var x0 = ln[0] * size.w, y0 = ln[1] * size.h, x1 = ln[2] * size.w, y1 = ln[3] * size.h, text = ln[4];
+      var h = Math.max(4, y1 - y0), fontPx = h * 0.88;
+      var span = document.createElement("span");
+      span.textContent = text;
+      span.style.left = x0 + "px";
+      span.style.top = (y0 + (h - fontPx) * 0.5) + "px";
+      span.style.fontSize = fontPx + "px";
+      measureCtx.font = fontPx + "px Arial, Helvetica, sans-serif";
+      var natural = measureCtx.measureText(text).width;
+      if (natural > 0) span.style.transform = "scaleX(" + ((x1 - x0) / natural) + ")";
+      frag.appendChild(span);
+      frag.appendChild(document.createElement("br"));
+    });
+    textLayer.appendChild(frag);
+  }
+
+  function buildHighlights(size) {
+    hlLayer.textContent = "";
+    (args.highlights || []).forEach(function (r) {
+      var d = document.createElement("div");
+      d.className = "hl";
+      d.style.left = (r[0] * size.w - 1) + "px"; d.style.top = (r[1] * size.h - 1) + "px";
+      d.style.width = ((r[2] - r[0]) * size.w + 2) + "px"; d.style.height = ((r[3] - r[1]) * size.h + 2) + "px";
+      hlLayer.appendChild(d);
+    });
+  }
+
+  function setMode(m) {
+    mode = m;
+    el("modeSelect").setAttribute("aria-pressed", String(m === "select"));
+    el("modeCrop").setAttribute("aria-pressed", String(m === "crop"));
+    cropLayer.classList.toggle("active", m === "crop");
+    textLayer.style.pointerEvents = m === "select" ? "auto" : "none";
+    hint.textContent = m === "select" ? "Select text, then click “Use selection”." : "Drag a box around a figure, table or equation.";
+    hidePop(); cropBox.style.display = "none";
+  }
+  el("modeSelect").onclick = function () { setMode("select"); };
+  el("modeCrop").onclick = function () { setMode("crop"); };
+
+  function hidePop() { pop.style.display = "none"; pop.textContent = ""; }
+  function showPop(x, y, buttons) {
+    pop.textContent = "";
+    buttons.forEach(function (b) {
+      var btn = document.createElement("button");
+      btn.textContent = b.label; if (b.secondary) btn.className = "secondary";
+      btn.onmousedown = function (e) { e.preventDefault(); };
+      btn.onclick = function (e) { e.preventDefault(); b.action(); };
+      pop.appendChild(btn);
+    });
+    pop.style.display = "flex";
+    var maxX = scroller.scrollLeft + scroller.clientWidth - pop.offsetWidth - 8;
+    pop.style.left = Math.max(scroller.scrollLeft + 4, Math.min(x, maxX)) + "px";
+    pop.style.top = y + "px";
+  }
+
+  // ---- text selection
+  function currentSelectionText() {
+    var sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !textLayer.contains(sel.anchorNode)) return "";
+    return sel.toString().normalize("NFKC").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  document.addEventListener("mouseup", function (e) {
+    if (mode !== "select" || pop.contains(e.target)) return;
+    setTimeout(function () {
+      var text = currentSelectionText();
+      if (!text) { hidePop(); return; }
+      var rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
+      var sRect = scroller.getBoundingClientRect();
+      showPop(rect.left - sRect.left + scroller.scrollLeft, rect.bottom - sRect.top + scroller.scrollTop + 6, [
+        { label: "Use selection", action: function () {
+            setValue({ event: "selection", text: text, page: args.page, nonce: Date.now() + Math.random() });
+            hint.textContent = "Selection sent to the assistant panel."; hidePop(); window.getSelection().removeAllRanges();
+        } },
+        { label: "Cancel", secondary: true, action: function () { hidePop(); window.getSelection().removeAllRanges(); } }
+      ]);
+    }, 10);
+  });
+
+  // ---- crop (pointer events: works with mouse, pen and touch)
+  var start = null;
+  function rel(e) {
+    var r = page.getBoundingClientRect();
+    return { x: Math.min(Math.max(e.clientX - r.left, 0), r.width), y: Math.min(Math.max(e.clientY - r.top, 0), r.height), w: r.width, h: r.height };
+  }
+  cropLayer.addEventListener("pointerdown", function (e) {
+    if (mode !== "crop") return;
+    e.preventDefault(); hidePop(); cropLayer.setPointerCapture(e.pointerId);
+    start = rel(e);
+    Object.assign(cropBox.style, { display: "block", left: start.x + "px", top: start.y + "px", width: "0px", height: "0px" });
+  });
+  cropLayer.addEventListener("pointermove", function (e) {
+    if (!start) return;
+    var p = rel(e);
+    Object.assign(cropBox.style, { left: Math.min(start.x, p.x) + "px", top: Math.min(start.y, p.y) + "px",
+      width: Math.abs(p.x - start.x) + "px", height: Math.abs(p.y - start.y) + "px" });
+  });
+  cropLayer.addEventListener("pointerup", function (e) {
+    if (!start) return;
+    var p = rel(e), s = start; start = null;
+    var x0 = Math.min(s.x, p.x) / p.w, y0 = Math.min(s.y, p.y) / p.h, x1 = Math.max(s.x, p.x) / p.w, y1 = Math.max(s.y, p.y) / p.h;
+    if (x1 - x0 < 0.02 || y1 - y0 < 0.01) { cropBox.style.display = "none"; return; }
+    var pageTop = page.offsetTop, pageLeft = page.offsetLeft;
+    showPop(pageLeft + x0 * p.w, pageTop + y1 * p.h + 6, [
+      { label: "Analyze this region", action: function () {
+          setValue({ event: "crop", rect: [x0, y0, x1, y1], page: args.page, nonce: Date.now() + Math.random() });
+          hint.textContent = "Region sent to the assistant panel."; hidePop();
+      } },
+      { label: "Cancel", secondary: true, action: function () { hidePop(); cropBox.style.display = "none"; } }
+    ]);
+  });
+
+  window.addEventListener("resize", function () { layout(); });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.type !== "streamlit:render") return;
+    var a = data.args || {};
+    if (a.theme) document.documentElement.setAttribute("data-theme", a.theme);
+    if (data.theme && data.theme.base) document.documentElement.setAttribute("data-theme", data.theme.base);
+    if (a.sig === lastSig) return; // unchanged page: keep scroll position and selection
+    var samePage = args && args.page === a.page && args.doc === a.doc;
+    var scrollTop = scroller.scrollTop;
+    args = a; lastSig = a.sig;
+    img.onload = function () { layout(); if (samePage) scroller.scrollTop = scrollTop; else scroller.scrollTop = 0; };
+    img.src = a.image;
+    layout();
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+  setHeight(700);
+})();
+</script>
+</body>
+</html>

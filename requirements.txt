@@ -1,0 +1,10 @@
+# Readray runtime dependencies (tested with Python 3.12 on 2026-10-11).
+streamlit>=1.65,<2
+pymupdf>=1.28,<2
+plotly>=6,<8
+pandas>=2.2,<4
+anthropic>=1.13,<2
+openai>=2,<4
+
+# Tests (not needed by Streamlit Community Cloud, but harmless)
+pytest>=8
